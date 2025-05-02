@@ -27,7 +27,7 @@ router.post(
     _next: NextFunction
   ): Promise<void> => {
     console.log("🛠️ AI Task request received.");
-    const issue = req.body as AiTaskRequest;
+    const issue = req.body;
 
     const issueKey = issue.issueKey || "test-issue-key";
     const issueSummary = issue.issueSummary || "Default summary";
@@ -48,6 +48,7 @@ router.post(
     const repoUrl = issue.repo;
     if (!repoUrl) {
       res.status(400).send({ error: "Missing repo URL in issue description." });
+      return;
     }
 
     const repoHash = crypto.createHash("md5").update(repoUrl).digest("hex");
@@ -78,8 +79,6 @@ router.post(
       let repoContext = "";
       const srcDir = path.join(localPath, "src");
 
-      console.log("srcDir:", srcDir);
-
       try {
         const stat = await fs.stat(srcDir);
         if (stat.isDirectory()) {
@@ -101,33 +100,31 @@ router.post(
             )
             .join("\n")}`;
         }
-      } catch (err) {
-        console.log("srcDir error:", err);
+      } catch {
         console.warn(
           "⚠️ 'src/' directory does not exist or can't be read. Skipping embeddings."
         );
       }
 
       const prompt = `
-    You are an expert software engineer. Based on the following repository context and issue details, provide the **exact code changes** required to complete the task.
-    
-    --- REPOSITORY CONTEXT ---
-    ${repoContext || "No files available. This might be a new repository."}
-    
-    --- ISSUE DETAILS ---
-    Title: ${issueSummary}
-    Description: ${issueDescription}
-    
-    --- INSTRUCTIONS ---
-    Only output file modifications using this format:
-    - Path: path/to/file.js
-    - Content:
-    <full file content>
-    
-    Do not include explanations, just the code changes.
-    `;
+You are an expert software engineer. Based on the following repository context and issue details, provide the **exact code changes** required to complete the task.
 
-      console.log("prompt:", prompt);
+--- REPOSITORY CONTEXT ---
+${repoContext || "No files available. This might be a new repository."}
+
+--- ISSUE DETAILS ---
+Title: ${issueSummary}
+Description: ${issueDescription}
+
+--- INSTRUCTIONS ---
+Only output file modifications using this format (use relative paths, like src/index.ts):
+- Path: src/index.ts
+- Content:
+<complete file content goes here — DO NOT include markdown formatting such as triple backticks>
+
+IMPORTANT: Do not include any triple backticks  or markdown syntax. Only raw file paths and content.
+Do not include explanations, just the code changes.
+`;
 
       console.log("💬 Sending to OpenAI...");
       const completion = await openai.chat.completions.create({
@@ -137,7 +134,7 @@ router.post(
       });
 
       const aiResponse = completion.choices[0].message.content ?? "";
-      console.log("🤖 OpenAI response received.", aiResponse);
+      console.log("🤖 OpenAI response received.");
 
       const changedFiles = await applyAiChanges(localPath, aiResponse);
 
@@ -158,18 +155,10 @@ router.post(
   }
 );
 
-async function readFileSafe(filePath: string): Promise<string> {
-  try {
-    return await fs.readFile(filePath, "utf-8");
-  } catch {
-    return "";
-  }
-}
-
 function cleanFileContent(rawContent: string): string {
   return rawContent
-    .replace(/^```(json|js|ts|tsx|jsx)?/i, "")
-    .replace(/```$/, "")
+    .replace(/^```[a-z]*\n?/i, "") // remove ```js or ```ts at the start
+    .replace(/\n?```$/, "") // remove trailing ```
     .trim();
 }
 
@@ -188,6 +177,7 @@ async function applyAiChanges(
   for (const block of fileBlocks) {
     const [filePathLine, ...contentLines] = block.split("\n");
     const relativeFilePath = filePathLine.trim();
+
     const contentStartIndex = contentLines.findIndex((line) =>
       line.startsWith("- Content:")
     );
@@ -196,7 +186,10 @@ async function applyAiChanges(
     const content = cleanFileContent(
       contentLines.slice(contentStartIndex + 1).join("\n")
     );
+
     const fullFilePath = path.join(localPath, relativeFilePath);
+    console.log("fullFilePath:", fullFilePath);
+    console.log("relativeFilePath:", relativeFilePath);
 
     await fs.mkdir(path.dirname(fullFilePath), { recursive: true });
     await fs.writeFile(fullFilePath, content, "utf-8");
@@ -206,10 +199,6 @@ async function applyAiChanges(
       relativePath: relativeFilePath,
     });
   }
-
-  changedFiles.forEach(({ fullPath }) => {
-    console.log(`✅ Modified: ${fullPath}`);
-  });
 
   return changedFiles;
 }
