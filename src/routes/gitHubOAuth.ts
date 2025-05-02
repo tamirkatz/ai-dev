@@ -68,15 +68,16 @@ router.get("/callback", async (req, res) => {
   );
 });
 
-// 3️⃣ Forge app will call this to look up the token
-router.get("/token", async (req, res): Promise<void> => {
+router.get("/token", async (req, res): Promise<any> => {
   const jiraUserId = req.query.userId as string;
   const tokens = await readTokens();
   const accessToken = tokens[jiraUserId];
+
   if (!accessToken) {
-    res.status(404).json({ error: "token_not_found" });
+    return res.status(404).json({ error: "token_not_found" });
   }
-  res.json({ access_token: accessToken });
+
+  return res.json({ access_token: accessToken });
 });
 
 export default router;
