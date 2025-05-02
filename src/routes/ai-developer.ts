@@ -17,6 +17,8 @@ interface AiTaskRequest {
   issueSummary?: string;
   issueDescription?: string;
   repo: string;
+  userName: string;
+  userEmail: string;
 }
 
 router.post(
@@ -139,6 +141,8 @@ Do not include explanations, just the code changes.
       const changedFiles = await applyAiChanges(localPath, aiResponse);
 
       console.log("🛠️ Committing and pushing...");
+      await repoGit.addConfig("user.name", issue.userName); // e.g., "John Doe"
+      await repoGit.addConfig("user.email", issue.userEmail); // e.g., "john@example.com"
       await repoGit.add(".");
       await repoGit.commit(`feat(${issueKey}): ${issueSummary}`);
       await repoGit.push("origin", branchName);
