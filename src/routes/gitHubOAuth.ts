@@ -1,31 +1,35 @@
-// src/routes/githubOAuth.ts
 import express from "express";
-import cors from "cors";
 import axios from "axios";
-import { promises as fs } from "fs";
-import path from "path";
+import cors from "cors";
 import dotenv from "dotenv";
+import { promises as fs, existsSync } from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
+
 const router = express.Router();
 router.use(cors());
 
-// where we'll keep tokens per Jira accountId
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOKENS_FILE = path.join(__dirname, "..", "github_tokens.json");
-const { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, SERVER_BASE_URL } =
-  process.env!;
 
-// helper to read/write JSON
 async function readTokens(): Promise<Record<string, string>> {
   try {
-    return JSON.parse(await fs.readFile(TOKENS_FILE, "utf-8"));
-  } catch {
-    return {};
+    const content = await fs.readFile(TOKENS_FILE, "utf-8");
+    return JSON.parse(content);
+  } catch (err: any) {
+    if (err.code === "ENOENT") return {};
+    throw err;
   }
 }
+
 async function writeTokens(data: Record<string, string>) {
   await fs.writeFile(TOKENS_FILE, JSON.stringify(data, null, 2));
 }
+
+// where we'll keep tokens per Jira accountId
+const { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, SERVER_BASE_URL } = process.env;
 
 // 1️⃣ Kick off the GitHub OAuth flow
 router.get("/init", (req, res) => {
