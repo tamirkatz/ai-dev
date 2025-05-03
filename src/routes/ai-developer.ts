@@ -29,6 +29,7 @@ interface IterationResult {
   prompt: string;
   aiResponse: string;
   buildError?: string;
+  testFailures?: string;
   changedFiles: string[];
 }
 
@@ -174,18 +175,37 @@ async function iterativeCodeGeneration(
     changed.forEach((f) => allChanged.add(f));
 
     let buildError: string | undefined;
+    let testFailures: string | undefined;
     try {
       console.log("🔵 [iterativeCodeGeneration] Building project");
       buildProject(localPath);
       console.log("🟢 [iterativeCodeGeneration] Build succeeded");
+
+      console.log("🔵 [iterativeCodeGeneration] Generating tests");
+      generateTests(localPath, changed);
+
+      console.log("🔵 [iterativeCodeGeneration] Running tests");
+      runTests(localPath);
+
+      console.log("🟢 [iterativeCodeGeneration] Tests passed");
     } catch (err: any) {
-      buildError = err.message;
-      console.error(
-        `🔴 [iterativeCodeGeneration] Build failed on attempt ${attemptNum}:`,
-        buildError
-      );
+      if (err.message.includes("Test failed")) {
+        testFailures = err.message;
+        console.error(
+          `🔴 [iterativeCodeGeneration] Tests failed on attempt ${attemptNum}:`,
+          testFailures
+        );
+      } else {
+        buildError = err.message;
+        console.error(
+          `🔴 [iterativeCodeGeneration] Build failed on attempt ${attemptNum}:`,
+          buildError
+        );
+      }
       attempt++;
-      currentDescription = `Previous code generated build errors:\n${buildError}\nPlease provide corrected code changes.`;
+      currentDescription = `Previous code generated errors:\n${
+        buildError || testFailures
+      }\nPlease provide corrected code changes.`;
       console.log(
         "🔵 [iterativeCodeGeneration] Updated description for next attempt"
       );
@@ -196,9 +216,10 @@ async function iterativeCodeGeneration(
       prompt,
       aiResponse,
       buildError,
+      testFailures,
       changedFiles: changed,
     });
-    if (!buildError) break;
+    if (!buildError && !testFailures) break;
   }
 
   return { changedFiles: Array.from(allChanged), iterations };
@@ -268,17 +289,27 @@ async function applyAiChanges(
     /- Path: ([^\n]+)\n- Content:\n([\s\S]*?)(?=(?:\n- Path:|$))/g;
   const changed: string[] = [];
   let match: RegExpExecArray | null;
+
   while ((match = fileRegex.exec(aiResponse))) {
     const relPath = match[1].trim();
+
+    // ——— Skip any placeholder or obviously invalid entries —————————
+    if (relPath.startsWith("<") || relPath.includes(">")) {
+      console.warn(`[applyAiChanges] Skipping invalid AI path: ${relPath}`);
+      continue;
+    }
+
     const content = cleanContent(match[2]);
     console.log(
       `🔵 [applyAiChanges] Writing file ${relPath} (${content.length} chars)`
     );
+
     const fullPath = path.join(localPath, relPath);
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
     await fs.writeFile(fullPath, content, "utf-8");
     changed.push(relPath);
   }
+
   console.log("🟢 [applyAiChanges] Total files written:", changed.length);
   return changed;
 }
@@ -288,6 +319,55 @@ function cleanContent(raw: string): string {
     .replace(/^```[a-z]*\n/, "")
     .replace(/\n```$/m, "")
     .trim();
+}
+
+/**
+ * For each changed file, create a minimal smoke-test in __tests__/
+ */
+async function generateTests(
+  cwd: string,
+  changedFiles: string[]
+): Promise<void> {
+  console.log("🔵 [generateTests] Creating test files for changed files");
+  for (const relFile of changedFiles) {
+    const ext = path.extname(relFile);
+    const base = path.basename(relFile, ext);
+    const testFileRel = path.join(
+      "__tests__",
+      relFile.replace(ext, `.test${ext}`)
+    );
+    const testFilePath = path.join(cwd, testFileRel);
+    const importPath = path
+      .relative(path.dirname(testFilePath), path.join(cwd, relFile))
+      .replace(/\\/g, "/");
+
+    const content = `import ${base} from '${importPath}';
+
+describe('${relFile}', () => {
+  it('should be defined', () => {
+    expect(${base}).toBeDefined();
+  });
+});
+`;
+
+    await fs.mkdir(path.dirname(testFilePath), { recursive: true });
+    await fs.writeFile(testFilePath, content, "utf8");
+    console.log(`🟢 [generateTests] Test file created: ${testFileRel}`);
+  }
+}
+
+/**
+ * Run Jest in CI mode; on any failures, throw an error prefixed with "Test failed"
+ */
+function runTests(cwd: string): void {
+  console.log("🔵 [runTests] Running Jest tests");
+  try {
+    // Adjust the command as needed if your npm script differs
+    execSync("npm test -- --ci --runInBand", { cwd, stdio: "inherit" });
+  } catch (err: any) {
+    // Wrap so that iterativeCodeGeneration sees "Test failed"
+    throw new Error(`Test failed: ${err.message}`);
+  }
 }
 
 export default router;
