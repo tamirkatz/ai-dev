@@ -1,16 +1,19 @@
 import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
-import { simpleGit } from "simple-git";
+import { simpleGit, SimpleGit } from "simple-git";
 import { OpenAI } from "openai";
-import { promises as fs, existsSync } from "fs";
+import fs from "fs/promises";
+import { existsSync } from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import { execSync } from "child_process";
 import { embedRepoFiles, searchRelevantFiles } from "../vectorStore.ts";
 
 const router = express.Router();
 const git = simpleGit();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MAX_RETRIES = 3;
 
 interface AiTaskRequest {
   issueKey?: string;
@@ -21,190 +24,270 @@ interface AiTaskRequest {
   userEmail: string;
 }
 
+interface IterationResult {
+  attempt: number;
+  prompt: string;
+  aiResponse: string;
+  buildError?: string;
+  changedFiles: string[];
+}
+
 router.post(
   "/ai-task",
   async (
     req: Request<{}, any, AiTaskRequest>,
     res: Response,
     _next: NextFunction
-  ): Promise<void> => {
-    console.log("🛠️ AI Task request received.");
+  ) => {
+    console.log("🔵 [Router] /ai-task called with body:", req.body);
     const issue = req.body;
-
-    const issueKey = issue.issueKey || "test-issue-key";
-    const issueSummary = issue.issueSummary || "Default summary";
-    const issueDescription =
-      issue.issueDescription ||
-      `
-    Please create a basic Express.js server project.
-
-    Requirements:
-    - A "src/index.js" that starts a server on port 3000
-    - Use express and body-parser (if needed)
-    - Add a "/" route that returns a test message
-    - Include a "package.json" with name, version, and dependencies
-    - Add a ".gitignore" that ignores node_modules
-    - Add a README.md with setup instructions
-  `;
-
-    const repoUrl = issue.repo;
-    if (!repoUrl) {
-      res.status(400).send({ error: "Missing repo URL in issue description." });
-      return;
-    }
-
-    const repoHash = crypto.createHash("md5").update(repoUrl).digest("hex");
-    const localPath = path.join(
-      os.tmpdir(),
-      "ai-assist-repos",
-      `${issueKey}-${repoHash}`
-    );
-
     try {
-      let repoGit;
-      if (existsSync(localPath)) {
-        console.log("🔄 Repo already exists — pulling latest changes...");
-        repoGit = simpleGit(localPath);
-        await repoGit.checkout("main");
-        await repoGit.pull("origin", "main");
-      } else {
-        console.log("🚀 Cloning fresh repo...");
-        await git.clone(repoUrl, localPath);
-        repoGit = simpleGit(localPath);
-      }
-
-      const x = Math.floor(Math.random() * 1000);
-      const branchName = `feature/${issueKey}${x}`;
-      console.log("🌿 Creating new branch...");
-      await repoGit.checkoutLocalBranch(branchName);
-
-      let repoContext = "";
-      const srcDir = path.join(localPath, "src");
-
-      try {
-        const stat = await fs.stat(srcDir);
-        if (stat.isDirectory()) {
-          console.log("📦 Embedding repo files...");
-          const collection = await embedRepoFiles(srcDir, issueKey);
-
-          console.log("🔎 Searching relevant files...");
-          const relevantFiles = await searchRelevantFiles(
-            collection,
-            issueDescription
-          );
-
-          repoContext = `Top relevant files:\n${relevantFiles
-            .map(
-              (f, i) =>
-                `--- File ${i + 1} ---\n content:${f.content} ---\n path: ${
-                  f.path
-                }`
-            )
-            .join("\n")}`;
-        }
-      } catch {
-        console.warn(
-          "⚠️ 'src/' directory does not exist or can't be read. Skipping embeddings."
-        );
-      }
-
-      const prompt = `
-You are an expert software engineer. Based on the following repository context and issue details, provide the **exact code changes** required to complete the task.
-
---- REPOSITORY CONTEXT ---
-${repoContext || "No files available. This might be a new repository."}
-
---- ISSUE DETAILS ---
-Title: ${issueSummary}
-Description: ${issueDescription}
-
---- INSTRUCTIONS ---
-Only output file modifications using this format (use relative paths, like src/index.ts):
-- Path: src/index.ts
-- Content:
-<complete file content goes here — DO NOT include markdown formatting such as triple backticks>
-
-IMPORTANT: Do not include any triple backticks  or markdown syntax. Only raw file paths and content.
-Do not include explanations, just the code changes.
-`;
-
-      console.log("💬 Sending to OpenAI...");
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-      });
-
-      const aiResponse = completion.choices[0].message.content ?? "";
-      console.log("🤖 OpenAI response received.");
-
-      const changedFiles = await applyAiChanges(localPath, aiResponse);
-
-      console.log("🛠️ Committing and pushing...");
-      await repoGit.addConfig("user.name", issue.userName); // e.g., "John Doe"
-      await repoGit.addConfig("user.email", issue.userEmail); // e.g., "john@example.com"
-      await repoGit.add(".");
-      await repoGit.commit(`feat(${issueKey}): ${issueSummary}`);
-      await repoGit.push("origin", branchName);
-
-      console.log(`✅ Branch ${branchName} pushed successfully.`);
-      res.status(200).send({
-        message: "Branch pushed successfully.",
-        changedFiles: changedFiles.map((f) => f.relativePath),
-      });
+      const result = await handleAiTask(issue);
+      console.log("🟢 [Router] Task completed with result:", result);
+      res.status(200).send(result);
     } catch (error: any) {
-      console.error("❌ Error:", error);
-      res.status(500).send({ error: error.message });
+      console.error("🔴 [Router] AI Task failed:", error);
+      res.status(500).send({ error: error.message, stack: error.stack });
     }
   }
 );
 
-function cleanFileContent(rawContent: string): string {
-  return rawContent
-    .replace(/^```[a-z]*\n?/i, "") // remove ```js or ```ts at the start
-    .replace(/\n?```$/, "") // remove trailing ```
-    .trim();
+async function handleAiTask(issue: AiTaskRequest) {
+  console.log("🔵 [handleAiTask] Starting handler with issue:", issue);
+  if (!issue.repo) throw new Error("Missing repo URL in request.");
+
+  const issueKey = issue.issueKey || "temp-issue";
+  const summary = issue.issueSummary || "AI Task";
+  let description = issue.issueDescription || "No description provided.";
+  console.log(`🔵 [handleAiTask] issueKey=${issueKey}, summary=${summary}`);
+
+  const repoUrl = issue.repo;
+  const hash = crypto.createHash("md5").update(repoUrl).digest("hex");
+  const localPath = path.join(
+    os.tmpdir(),
+    "ai-assist-repos",
+    `${issueKey}-${hash}`
+  );
+  console.log(`🔵 [handleAiTask] Using localPath=${localPath}`);
+
+  // prepare code and dependencies
+  await prepareRepository(repoUrl, localPath);
+  installDependencies(localPath);
+
+  const repoGit = simpleGit(localPath);
+  const branch = await createFeatureBranch(repoGit, issueKey);
+
+  const { changedFiles, iterations } = await iterativeCodeGeneration(
+    localPath,
+    issueKey,
+    summary,
+    description
+  );
+
+  // commit & push
+  console.log(
+    "🔵 [handleAiTask] Committing and pushing changes for branch:",
+    branch
+  );
+  await repoGit.addConfig("user.name", issue.userName);
+  await repoGit.addConfig("user.email", issue.userEmail);
+  await repoGit.add(".");
+  await repoGit.commit(`feat(${issueKey}): ${summary}`);
+  await repoGit.push("origin", branch);
+
+  console.log("🟢 [handleAiTask] Branch pushed successfully:", branch);
+  return {
+    message: `Branch ${branch} pushed successfully.`,
+    changedFiles,
+    iterations,
+  };
 }
 
-interface ChangedFile {
-  fullPath: string;
-  relativePath: string;
+async function prepareRepository(repoUrl: string, localPath: string) {
+  console.log("🔵 [prepareRepository] Checking repository at", localPath);
+  if (existsSync(localPath)) {
+    console.log("🔵 [prepareRepository] Repo exists, pulling latest changes");
+    const repoGit = simpleGit(localPath);
+    await repoGit.checkout("main");
+    await repoGit.pull("origin", "main");
+    console.log("🟢 [prepareRepository] Pull complete");
+  } else {
+    console.log("🔵 [prepareRepository] Cloning repository from", repoUrl);
+    await git.clone(repoUrl, localPath);
+    console.log("🟢 [prepareRepository] Clone complete");
+  }
+}
+
+function installDependencies(cwd: string) {
+  console.log("🔵 [installDependencies] Installing NPM dependencies");
+  try {
+    execSync("npm ci --ignore-scripts", { cwd, stdio: "pipe" });
+    console.log("🟢 [installDependencies] Dependencies installed");
+  } catch (err: any) {
+    console.warn(
+      "⚠️ [installDependencies] npm ci failed, attempting npm install"
+    );
+    execSync("npm install", { cwd, stdio: "pipe" });
+    console.log("🟢 [installDependencies] npm install complete");
+  }
+}
+
+async function createFeatureBranch(repoGit: SimpleGit, issueKey: string) {
+  const count = Math.floor(Math.random() * 1000);
+  const branch = `feature/${issueKey}-${count}`;
+  console.log("🔵 [createFeatureBranch] Creating branch", branch);
+  await repoGit.checkoutLocalBranch(branch);
+  console.log("🟢 [createFeatureBranch] Branch created:", branch);
+  return branch;
+}
+
+async function iterativeCodeGeneration(
+  localPath: string,
+  issueKey: string,
+  summary: string,
+  description: string
+): Promise<{ changedFiles: string[]; iterations: IterationResult[] }> {
+  console.log(
+    "🔵 [iterativeCodeGeneration] Starting iterative code generation"
+  );
+  let attempt = 0;
+  const allChanged = new Set<string>();
+  let currentDescription = description;
+  const iterations: IterationResult[] = [];
+
+  while (attempt < MAX_RETRIES) {
+    const attemptNum = attempt + 1;
+    console.log(
+      `🔵 [iterativeCodeGeneration] Attempt ${attemptNum}/${MAX_RETRIES}`
+    );
+    const repoContext = await gatherRepoContext(localPath, issueKey);
+    const prompt = buildPrompt(repoContext, summary, currentDescription);
+    console.log(`🔵 [iterativeCodeGeneration] Prompt length ${prompt.length}`);
+
+    const aiResponse = await generateAiChange(prompt);
+    console.log(
+      `🟣 [iterativeCodeGeneration] AI response length ${aiResponse.length}`
+    );
+
+    const changed = await applyAiChanges(localPath, aiResponse);
+    console.log("🟢 [iterativeCodeGeneration] Changed files:", changed);
+    changed.forEach((f) => allChanged.add(f));
+
+    let buildError: string | undefined;
+    try {
+      console.log("🔵 [iterativeCodeGeneration] Building project");
+      buildProject(localPath);
+      console.log("🟢 [iterativeCodeGeneration] Build succeeded");
+    } catch (err: any) {
+      buildError = err.message;
+      console.error(
+        `🔴 [iterativeCodeGeneration] Build failed on attempt ${attemptNum}:`,
+        buildError
+      );
+      attempt++;
+      currentDescription = `Previous code generated build errors:\n${buildError}\nPlease provide corrected code changes.`;
+      console.log(
+        "🔵 [iterativeCodeGeneration] Updated description for next attempt"
+      );
+    }
+
+    iterations.push({
+      attempt: attemptNum,
+      prompt,
+      aiResponse,
+      buildError,
+      changedFiles: changed,
+    });
+    if (!buildError) break;
+  }
+
+  return { changedFiles: Array.from(allChanged), iterations };
+}
+
+async function gatherRepoContext(directory: string, issueKey: string) {
+  const srcDir = path.join(directory, "src");
+  console.log("🔵 [gatherRepoContext] Checking srcDir:", srcDir);
+  if (existsSync(srcDir)) {
+    console.log("🔵 [gatherRepoContext] Embedding files");
+    const collection = await embedRepoFiles(srcDir, issueKey);
+    const relevant = await searchRelevantFiles(collection, issueKey);
+    console.log(
+      "🔵 [gatherRepoContext] Relevant files count:",
+      relevant.length
+    );
+    return relevant
+      .map((f, i) => `--- File ${i + 1} (${f.path}) ---\n${f.content}`)
+      .join("\n");
+  }
+  console.warn("⚠️ [gatherRepoContext] No srcDir");
+  return "No files available.";
+}
+
+function buildPrompt(
+  repoContext: string,
+  summary: string,
+  description: string
+) {
+  return `You are an expert software engineer. Based on the following repository context and issue details, provide the exact code changes required.
+
+--- REPO CONTEXT ---
+${repoContext}
+
+--- ISSUE ---
+Title: ${summary}
+Description: ${description}
+
+Format:
+- Path: <relative/path>
+- Content:
+<full file content, no markdown>
+
+Do not include explanations.`;
+}
+
+async function generateAiChange(prompt: string): Promise<string> {
+  console.log("🔵 [generateAiChange] Sending prompt to OpenAI");
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.1,
+  });
+  return resp.choices[0].message.content || "";
+}
+
+function buildProject(cwd: string) {
+  execSync("npm run build", { cwd, stdio: "pipe" });
 }
 
 async function applyAiChanges(
   localPath: string,
   aiResponse: string
-): Promise<ChangedFile[]> {
-  const changedFiles: ChangedFile[] = [];
-  const fileBlocks = aiResponse.split("- Path: ").slice(1);
-
-  for (const block of fileBlocks) {
-    const [filePathLine, ...contentLines] = block.split("\n");
-    const relativeFilePath = filePathLine.trim();
-
-    const contentStartIndex = contentLines.findIndex((line) =>
-      line.startsWith("- Content:")
+): Promise<string[]> {
+  console.log("🔵 [applyAiChanges] Parsing AI response");
+  const fileRegex =
+    /- Path: ([^\n]+)\n- Content:\n([\s\S]*?)(?=(?:\n- Path:|$))/g;
+  const changed: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = fileRegex.exec(aiResponse))) {
+    const relPath = match[1].trim();
+    const content = cleanContent(match[2]);
+    console.log(
+      `🔵 [applyAiChanges] Writing file ${relPath} (${content.length} chars)`
     );
-    if (contentStartIndex === -1) continue;
-
-    const content = cleanFileContent(
-      contentLines.slice(contentStartIndex + 1).join("\n")
-    );
-
-    const fullFilePath = path.join(localPath, relativeFilePath);
-    console.log("fullFilePath:", fullFilePath);
-    console.log("relativeFilePath:", relativeFilePath);
-
-    await fs.mkdir(path.dirname(fullFilePath), { recursive: true });
-    await fs.writeFile(fullFilePath, content, "utf-8");
-
-    changedFiles.push({
-      fullPath: fullFilePath,
-      relativePath: relativeFilePath,
-    });
+    const fullPath = path.join(localPath, relPath);
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, content, "utf-8");
+    changed.push(relPath);
   }
+  console.log("🟢 [applyAiChanges] Total files written:", changed.length);
+  return changed;
+}
 
-  return changedFiles;
+function cleanContent(raw: string): string {
+  return raw
+    .replace(/^```[a-z]*\n/, "")
+    .replace(/\n```$/m, "")
+    .trim();
 }
 
 export default router;

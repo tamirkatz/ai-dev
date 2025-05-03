@@ -6,6 +6,18 @@ import { promises as fs, existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
+const TOKEN_FILE = "./github_app_token.json";
+
+export async function saveGlobalGitHubToken(token: string) {
+  await fs.writeFile(TOKEN_FILE, JSON.stringify({ token }), "utf8");
+}
+
+export async function getGlobalGitHubToken() {
+  if (!(await fs.stat(TOKEN_FILE).catch(() => false))) return null;
+  const data = await fs.readFile(TOKEN_FILE, "utf8");
+  return JSON.parse(data).token;
+}
+
 dotenv.config();
 
 const router = express.Router();
@@ -34,37 +46,42 @@ const { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, SERVER_BASE_URL } = process.env;
 // 1️⃣ Kick off the GitHub OAuth flow
 router.get("/init", (req, res) => {
   const jiraUserId = req.query.userId as string;
+  console.log("in init", jiraUserId);
   const redirectUri = `${SERVER_BASE_URL}/oauth/callback`;
   const githubAuthorizeUrl = new URL(
     "https://github.com/login/oauth/authorize"
   );
   githubAuthorizeUrl.searchParams.set("client_id", GITHUB_CLIENT_ID!);
-  githubAuthorizeUrl.searchParams.set("redirect_uri", redirectUri);
   githubAuthorizeUrl.searchParams.set("scope", "repo");
   githubAuthorizeUrl.searchParams.set("state", jiraUserId);
-  res.redirect(githubAuthorizeUrl.toString());
+  return res.redirect(githubAuthorizeUrl.toString());
 });
 
 // 2️⃣ GitHub redirects back here with ?code=…&state=JIRA_ID
-router.get("/callback", async (req, res) => {
-  const code = req.query.code as string;
-  const jiraUserId = req.query.state as string;
+// GET /oauth/callback
+router.get("/oauth/callback", async (req, res): Promise<any> => {
+  const code = req.query.code;
+  const state = req.query.state;
 
-  // exchange code for access_token
-  const tokenResp = await axios.post(
+  const tokenResponse = await axios.post(
     "https://github.com/login/oauth/access_token",
-    { client_id: GITHUB_CLIENT_ID, client_secret: GITHUB_CLIENT_SECRET, code },
-    { headers: { Accept: "application/json" } }
+    {
+      client_id: GITHUB_CLIENT_ID,
+      client_secret: GITHUB_CLIENT_SECRET,
+      code,
+    },
+    {
+      headers: { Accept: "application/json" },
+    }
   );
-  const accessToken = tokenResp.data.access_token as string;
 
-  // persist
-  const tokens = await readTokens();
-  tokens[jiraUserId] = accessToken;
-  await writeTokens(tokens);
+  const token = tokenResponse.data.access_token;
 
-  res.send(
-    "✅ GitHub authorization successful! You can now go back to your Jira issue."
+  // 💾 Save token securely on server
+  await saveGlobalGitHubToken(token);
+
+  return res.send(
+    "✅ GitHub authorized successfully! You can close this window."
   );
 });
 
