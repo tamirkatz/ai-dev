@@ -4,6 +4,8 @@ import { OpenAI } from "openai";
 import path from "path";
 import fs from "fs/promises";
 import dotenv from "dotenv";
+import { existsSync } from "fs";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -14,9 +16,24 @@ export async function embedRepoFiles(
   folderPath: string,
   collectionName: string
 ): Promise<Collection> {
+  // Step 1: Replace invalid characters
+  let safeName = collectionName.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+  // Step 2: Enforce start/end characters are alphanumeric
+  if (!/^[a-zA-Z0-9]/.test(safeName)) safeName = "a" + safeName;
+  if (!/[a-zA-Z0-9]$/.test(safeName)) safeName = safeName + "z";
+
+  // Step 3: Enforce length constraints
+  if (safeName.length < 3) {
+    safeName = safeName.padEnd(3, "x");
+  } else if (safeName.length > 64) {
+    // fallback to a hash of the original name
+    safeName = crypto.createHash("md5").update(collectionName).digest("hex");
+  }
+
   const files = await collectFiles(folderPath);
   const collection = await chroma.getOrCreateCollection({
-    name: collectionName,
+    name: safeName,
   });
 
   for (const file of files) {
@@ -50,7 +67,7 @@ export async function searchRelevantFiles(
   const docs = results.documents?.[0] || [];
   const metadatas = results.metadatas?.[0] || [];
 
-  return docs.map((content, i) => ({
+  return docs.map((content: any, i: number) => ({
     content,
     path: metadatas[i]?.path || `unknown_${i}.js`,
   }));
